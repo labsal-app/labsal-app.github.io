@@ -901,7 +901,7 @@ async function cerrarLote(){
     consumos[f.i] = i.grupo === "env" ? f.c*unidades : (toN(r.pesos[f.i])||0);
   }
   let costoMP = 0; for (const id in consumos) costoMP += consumos[id]*costoIns(id);
-  const doc = loteDoc(r, {estado: cq==="rechazado" ? "rechazado" : "cerrado", fin, duracionSeg:Math.round(dur), unidades, consumos, costoMP, costoUnit: unidades ? costoMP/unidades : 0, cq, vence: addMonths(r.inicio, p.vidaUtil||24), notas: last.vals.notas||"", paso: pasos.length-1});
+  const doc = loteDoc(r, {estado: cq==="rechazado" ? "rechazado" : "cerrado", fin, duracionSeg:Math.round(dur), unidades, consumos, costoMP, costoUnit: unidades ? costoMP/unidades : 0, cq, vence: addMonths(r.inicio, p.vidaUtil||24), notas: last.vals.notas||"", paso: pasos.length-1, snap: snapDe(p, pasos)});
   wake(false);
   if (r.practica){
     S.run = null; S.view = "producir"; render();
@@ -914,9 +914,15 @@ async function cerrarLote(){
 }
 
 /* ---------- batch record ---------- */
+function snapDe(p, pasos){
+  return JSON.parse(JSON.stringify({pasos: pasos.map(s => ({t:s.t, tipo:s.tipo, campos:s.campos})), formula: p.formula||[]}));
+}
 function brData(l){
-  const p = prod(l.productoId) || {nombre:l.productoId, formula:[], pasos:[]};
-  const pasos = pasosDe(p);
+  /* cada lote guarda la foto del proceso con el que se hizo: si después cambian fórmula o pasos, su batch record no se altera */
+  const p0 = prod(l.productoId) || {nombre:l.productoId, formula:[], pasos:[]};
+  const sn = l.snap || null;
+  const p = sn && sn.formula ? Object.assign({}, p0, {formula: sn.formula}) : p0;
+  const pasos = sn && sn.pasos ? sn.pasos : pasosDe(p0);
   const vals = {}; (l.log||[]).forEach(g => Object.assign(vals, g.vals||{}));
   return {p, pasos, vals};
 }
@@ -1176,6 +1182,9 @@ function makeLocalDb(){
     doc: path => { const [c, id] = String(path).split("/"); return docRef(c, id); },
     dump: () => clone(store),
     replaceAll: datos => commit(() => { store = clone(datos); }),
+    tx: fn => commit(() => fn(store)),
+    peek: (c, id) => (store[c] || {})[id],
+    peekCol: c => store[c] || {},
     vacio: () => !Object.values(store).some(o => o && Object.keys(o).length)
   };
   window.addEventListener("storage", e => {
@@ -1184,6 +1193,101 @@ function makeLocalDb(){
     notify();
   });
   return LOCAL;
+}
+
+/* ---------- actualización de fórmulas y proceso (v3 · 25/11/2026) ----------
+   Se aplica una sola vez en cada celu, apenas hay datos cargados y ningún lote de Calma o Recovery en curso.
+   Fuente: LabSal-Formulas.csv + LabSal-Proceso-Produccion.pdf + pedidos de Mateo
+   (sacar sal del Himalaya, sumar polisorbato, cantidad de MgSO₄ en el paso de la sal, sellar con selladora). */
+const PROC_VER = 3;
+/* id: [nombre, unidad, grupo, mínimo para un lote de 5 kg] (el mínimo solo se usa si el insumo no existía) */
+const PROC_INS = {
+  "ae-lavanda":["AE Lavanda Mont Blanc","g","mp",20], "ae-ylang":["AE Ylang Ylang III","g","mp",10],
+  "ae-romero":["AE Romero","g","mp",12.5], "ae-eucalipto":["AE Eucalipto","g","mp",10], "ae-menta":["AE Menta piperita","g","mp",2.5],
+  "vit-e":["Vitamina E (tocoferol mixto)","g","mp",10], "polisorbato-80-tween-80":["Polisorbato 80 - TWEEN 80","g","mp",50],
+  "sio2":["Dióxido de silicio (anticaking)","g","mp",20], "mgso4-fino":["Sulfato de magnesio USP","g","mp",9865],
+  "doypack-calma":["Doypack 1 kg impresa · Calma","u","env",5], "etiqueta-calma":["Etiqueta Calma","u","env",5],
+  "doypack-kraft":["Doypack kraft 1 kg · Recovery","u","env",5], "etiqueta-recovery":["Etiqueta Recovery","u","env",5]
+};
+const PROC_OBSOLETOS = ["himalaya-fina","himalaya-gruesa","mgso4-medio","mgso4-grueso","arnica"];
+const PROC_PROD = {
+  calma: {sub:"Sales de baño · Lavanda y Ylang Ylang", tiempo:"30–40 min", envase:"doypack",
+    aceites:"Lavanda {i:ae-lavanda}, Ylang Ylang {i:ae-ylang}",
+    notas:"Fórmula de 1.000 g exactos (proceso del 25/11/2026). Si en el baño aparecen gotitas de aceite flotando: polisorbato 80 a 6 g y sulfato de magnesio a 985 g por kilo.",
+    formula:[["ae-lavanda",4],["ae-ylang",2],["vit-e",1],["polisorbato-80-tween-80",5],["sio2",2],["mgso4-fino",986],["doypack-calma",1],["etiqueta-calma",1]]},
+  recovery: {sub:"Sales de baño · Romero, eucalipto y menta", tiempo:"30–40 min", envase:"doypack kraft",
+    aceites:"Romero {i:ae-romero}, Eucalipto {i:ae-eucalipto}, Menta {i:ae-menta}",
+    notas:"Fórmula de 1.000 g exactos (proceso del 25/11/2026). Si en el baño aparecen gotitas de aceite flotando: polisorbato 80 a 6 g y sulfato de magnesio a 986 g por kilo.",
+    formula:[["ae-romero",2.5],["ae-eucalipto",2],["ae-menta",0.5],["vit-e",1],["polisorbato-80-tween-80",5],["sio2",2],["mgso4-fino",987],["doypack-kraft",1],["etiqueta-recovery",1]]}
+};
+function pasosSal(d){
+  return [
+    {t:"Preparar el ambiente", items:["Aire acondicionado prendido desde hace 1 a 2 horas (humedad por debajo del 60%)","Vaso de vidrio, bowl grande, cucharas y atomizador desinfectados con alcohol 70% y completamente secos","Barbijo a mano para el dióxido de silicio"]},
+    {t:"Fase aceitosa", min:2, alerta:"Si el atomizador se tapa, entibiá la mezcla a baño maría.",
+      items:["Vaso de vidrio sobre la balanza, tarado","Agregar "+d.aceites+", Vitamina E {i:vit-e} y Polisorbato 80 {i:polisorbato-80-tween-80}","Revolver 1 a 2 minutos, hasta que quede homogéneo","Cargar la mezcla en el atomizador"]},
+    {t:"Sal", alerta:"El sulfato de magnesio absorbe la humedad del aire: no dejes la bolsa abierta.",
+      items:["Volcar y pesar {i:mgso4-fino} de sulfato de magnesio en el bowl grande","Cerrar la bolsa de sal enseguida y sellar la conservadora"]},
+    {t:"Anotar pesos reales", tipo:"pesaje", intro:"Cargá lo que marcó la balanza en cada insumo.",
+      items:["Pesar aparte {i:sio2} de dióxido de silicio, con barbijo, y tapar"]},
+    {t:"Mezcla", critico:true, min:5, alerta:"Lluvia fina y mezclando sin parar: si la fase aceitosa cae de golpe, quedan zonas húmedas que después se apelmazan.",
+      items:["Rociar la fase aceitosa sobre la sal en lluvia fina, mezclando de forma continua","Mezclar 5 a 10 minutos","No quedan zonas húmedas"]},
+    {t:"Antiapelmazante", min:3, alerta:"Barbijo puesto: el dióxido de silicio es un polvo muy fino.",
+      items:["Tamizar el dióxido de silicio sobre la mezcla, lejos de la salida del aire","Mezclar 2 a 3 minutos más"]},
+    {t:"Control de calidad", tipo:"cq", alerta:"Si en el agua aparecen gotitas de aceite flotando, para el próximo lote subí el polisorbato 80 a 6 g por kilo y bajá la sal 1 g (Ajustes → Productos y fórmulas).",
+      items:["Muestras del borde, el centro y el fondo del bowl","Aroma parejo en todas las muestras","Sin zonas húmedas ni grumos: la sal corre suelta","Disolver un puñado en agua tibia y fijarse si quedan gotitas de aceite flotando"]},
+    {t:"Envasado", items:["Llenar cada "+d.envase+" con {peso}, verificado en balanza","Sacar casi todo el aire apretando de abajo hacia el cierre; dejar dos dedos libres arriba","Limpiar el zip y cerrar","Sellar con la selladora por encima del zip"]},
+    {t:"Registro y trazabilidad",
+      items:["Etiqueta puesta en cada unidad","Lote {codigo} y fecha {fecha} anotados en cada unidad","Contramuestra de 100 g guardada, cerrada y etiquetada con el lote","Revisión agendada: una unidad a los 7 y a los 14 días (aroma, humedad y apelmazamiento)"],
+      campos:[{k:"lotesIns", l:"Lote del proveedor de cada insumo", tipo:"text", req:true}]},
+    {t:"Cierre del lote", tipo:"cierre", items:[]}
+  ];
+}
+function aplicarProceso(st){
+  const C = n => (st[n] = st[n] || {});
+  const insC = C("insumos"), prC = C("productos"), loC = C("lotes"), coC = C("compras"), ajC = C("ajustes"), cfC = C("config");
+  const protoPasos = (cfC.protocolo && cfC.protocolo.pasos) || [];
+  /* 1. foto del proceso anterior en cada lote ya hecho, para que su batch record no cambie */
+  for (const id in loC){
+    const l = loC[id], p = l && prC[l.productoId];
+    if (!p || l.snap || !PROC_PROD[l.productoId]) continue;
+    l.snap = snapDe(p, [...protoPasos, ...(p.pasos||[])]);
+  }
+  /* 2. insumos: se buscan por id y, si no, por nombre; si no existen, se crean */
+  const norm = s => String(s||"").toLowerCase().normalize("NFD").replace(/[̀-ͯ]/g,"").replace(/[^a-z0-9]+/g," ").trim();
+  const m = {};
+  for (const k in PROC_INS){
+    const [nombre, unidad, grupo, minimo] = PROC_INS[k];
+    let id = insC[k] ? k : Object.keys(insC).find(x => insC[x] && norm(insC[x].nombre) === norm(nombre));
+    if (!id){ id = k; insC[id] = {nombre, unidad, grupo, minimo, proveedor:""}; }
+    m[k] = id;
+  }
+  const mapStr = s => s.replace(/\{i:([a-z0-9-]+)\}/g, (_,k) => "{i:"+(m[k]||k)+"}");
+  /* 3. fórmulas y pasos (precio, prefijo, vida útil y presentación no se tocan) */
+  for (const pid in PROC_PROD){
+    const d = PROC_PROD[pid], p = prC[pid]; if (!p) continue;
+    p.formula = d.formula.map(([k,c]) => ({i:m[k], c}));
+    p.pasos = JSON.parse(JSON.stringify(pasosSal(d)), (key,v) => typeof v === "string" ? mapStr(v) : v);
+    p.sub = d.sub; p.notas = d.notas; p.tiempo = d.tiempo; p.pesoNeto = 1000;
+  }
+  /* 4. insumos del proceso viejo (Himalaya, MgSO₄ medio y grueso, árnica): se borran si nunca se usaron; si tienen movimientos, quedan sin alerta de mínimo */
+  const usados = new Set();
+  for (const id in prC) for (const f of (prC[id].formula||[])) usados.add(f.i);
+  for (const id in coC) usados.add(coC[id].insumoId);
+  for (const id in ajC) if (ajC[id].tipo === "insumo") usados.add(ajC[id].refId);
+  for (const id in loC){ const l = loC[id]; Object.keys(l.consumos||{}).forEach(x => usados.add(x)); Object.keys(l.pesos||{}).forEach(x => usados.add(x)); }
+  for (const id of PROC_OBSOLETOS){ if (!insC[id]) continue; if (usados.has(id)) insC[id].minimo = 0; else delete insC[id]; }
+  cfC.migraciones = Object.assign({}, cfC.migraciones, {proceso: PROC_VER, fecha: new Date().toISOString()});
+}
+let migBusy = false;
+function migrarProceso(){
+  if (migBusy || !LOCAL || !S.ready || S.run) return;
+  const mg = LOCAL.peek("config","migraciones");
+  if (mg && mg.proceso >= PROC_VER) return;
+  const P = LOCAL.peekCol("productos");
+  if (!P.calma && !P.recovery) return; /* celu vacío: espera a que restauren la copia */
+  if (Object.values(LOCAL.peekCol("lotes")).some(l => l && l.estado === "en_curso" && PROC_PROD[l.productoId])) return; /* espera a que se cierre el lote */
+  migBusy = true;
+  write(() => LOCAL.tx(aplicarProceso), "Fórmulas y proceso de Calma y Recovery actualizados.").then(() => { migBusy = false; });
 }
 
 /* ---------- copias de seguridad ---------- */
@@ -1274,7 +1378,7 @@ async function boot(){
   if (!db){ S.noDb = true; S.ready = true; render(); return; }
   S.db = db;
   const pend = new Set([...COLS, "cfg", "proto"]);
-  const done = k => { if (pend.delete(k) && !pend.size) S.ready = true; schedule(); };
+  const done = k => { if (pend.delete(k) && !pend.size) S.ready = true; schedule(); if (S.ready) migrarProceso(); };
   const onErr = k => err => { if (err && err.code !== "revoked") toast("No se pudieron leer los datos ("+k+")."); done(k); };
   for (const c of COLS) db.collection(c).onSnapshot(snap => { S[c] = snap.docs.map(d => Object.assign({id:d.id}, d.data())); done(c); }, onErr(c));
   db.doc("config/general").onSnapshot(s => { S.cfg = s.exists ? s.data() : {}; done("cfg"); }, onErr("cfg"));

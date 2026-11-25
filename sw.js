@@ -1,5 +1,5 @@
 /* LabSal: funciona sin internet. Cambiar VERSION en cada publicación. */
-const VERSION = "labsal-2026-11-11-1";
+const VERSION = "labsal-2026-11-25-1";
 const CORE = ["./", "index.html", "manifest.webmanifest", "icons/icon-192.png", "icons/icon-512.png", "icons/icon-maskable-512.png", "icons/apple-touch-icon.png", "icons/favicon-32.png"];
 self.addEventListener("install", e => {
   e.waitUntil(caches.open(VERSION).then(c => c.addAll(CORE)).then(() => self.skipWaiting()));
